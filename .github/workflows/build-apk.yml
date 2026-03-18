@@ -1,0 +1,176 @@
+name: 🤖 Build Android APK & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build APK and Create Release
+    runs-on: ubuntu-latest
+
+
+    steps:
+      # ── 1. Checkout code ──────────────────────────────────────────────
+      - name: ⬇️ Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          submodules: false
+          clean: false
+
+      # ── 1b. Remove stale submodule config ─────────────────────────────
+      - name: 🧹 Clear stale submodule references
+        run: |
+          git submodule deinit --all --force 2>/dev/null || true
+          git config --remove-section submodule 2>/dev/null || true
+          if [ -f .gitmodules ]; then
+            git config -f .gitmodules --remove-section submodule 2>/dev/null || true
+            [ -s .gitmodules ] || rm -f .gitmodules
+          fi
+          git rm --cached sadguruclasses 2>/dev/null || true
+
+      # ── 2. Set VERSION env variable ───────────────────────────────────
+      - name: 🏷️ Set version name
+        run: |
+          if [[ "${{ github.ref_name }}" == "main" || "${{ github.ref_name }}" == "master" ]]; then
+            VERSION="v1.0-$(date +%Y%m%d-%H%M)"
+            echo "VERSION=${VERSION}" >> $GITHUB_ENV
+            echo "IS_MANUAL=true" >> $GITHUB_ENV
+          else
+            echo "VERSION=${{ github.ref_name }}" >> $GITHUB_ENV
+            echo "IS_MANUAL=false" >> $GITHUB_ENV
+          fi
+
+      # ── 3. Create git tag for manual runs ─────────────────────────────
+      - name: 🔖 Create git tag (manual runs only)
+        if: env.IS_MANUAL == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag ${{ env.VERSION }}
+          git push origin ${{ env.VERSION }}
+
+      # ── 4. Setup Node.js ──────────────────────────────────────────────
+      - name: 🟢 Setup Node.js 22 LTS
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      # ── 5. Install JS dependencies ────────────────────────────────────
+      - name: 📦 Install npm dependencies
+        run: npm ci --legacy-peer-deps
+
+      # ── 6. Build the web app ──────────────────────────────────────────
+      - name: 🏗️ Build web app
+        run: npm run build
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+
+      # ── 7. Verify android/ folder exists ──────────────────────────────
+      - name: ✅ Check android/ folder exists
+        run: |
+          if [ ! -d "android" ]; then
+            echo "❌ ERROR: The android/ folder does not exist in the repo."
+            exit 1
+          fi
+          echo "✅ android/ folder found"
+
+      # ── 8. Setup Java 21 ─────────────────────────────────────────────
+      - name: ☕ Setup Java 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      # ── 9. Sync Capacitor ─────────────────────────────────────────────
+      - name: 🔄 Sync Capacitor (dist → android)
+        run: npx cap sync android
+
+      # ── 10. Make Gradle wrapper executable ────────────────────────────
+      - name: 🔧 Make Gradlew executable
+        run: chmod +x android/gradlew
+
+      # ── 11. Install Android SDK 35 ────────────────────────────────────
+      - name: 📲 Install Android SDK 35
+        run: |
+          echo "y" | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platforms;android-35" "build-tools;35.0.0" || true
+
+      # ── 12. Build debug APK ───────────────────────────────────────────
+      - name: 🤖 Build Debug APK
+        run: cd android && ./gradlew assembleDebug --no-daemon
+        env:
+          GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.jvmargs=-Xmx2048m"
+
+      # ── 13. Verify APK was built ──────────────────────────────────────
+      - name: 📋 List built APK
+        run: |
+          APK_PATH="android/app/build/outputs/apk/debug/app-debug.apk"
+          if [ ! -f "$APK_PATH" ]; then
+            echo "❌ APK not found at expected path: $APK_PATH"
+            find android -name "*.apk" 2>/dev/null || echo "No APKs found anywhere"
+            exit 1
+          fi
+          SIZE=$(du -sh "$APK_PATH" | cut -f1)
+          echo "✅ APK built successfully: $APK_PATH ($SIZE)"
+
+      # ── 14. Rename APK with version ───────────────────────────────────
+      - name: 🏷️ Rename APK with version tag
+        run: |
+          cp android/app/build/outputs/apk/debug/app-debug.apk \
+             "NaveenBharat-${{ env.VERSION }}.apk"
+          echo "APK_FILE=NaveenBharat-${{ env.VERSION }}.apk" >> $GITHUB_ENV
+
+      # ── 14b. Create fixed-name copy for static download URL ───────────
+      - name: 🏷️ Create fixed-name APK copy (for static URL)
+        run: |
+          cp "NaveenBharat-${{ env.VERSION }}.apk" "NaveenBharat.apk"
+          echo "APK_FIXED=NaveenBharat.apk" >> $GITHUB_ENV
+
+      # ── 15. Upload APK as workflow artifact ───────────────────────────
+      - name: 📤 Upload APK artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: naveen-bharat-apk-${{ env.VERSION }}
+          path: ${{ env.APK_FILE }}
+          retention-days: 30
+
+      # ── 16. Create GitHub Release with APK attached ───────────────────
+      - name: 🚀 Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.VERSION }}
+          name: "Naveen Bharat ${{ env.VERSION }}"
+          body: |
+            ## 📱 Naveen Bharat ${{ env.VERSION }}
+
+            ### 📥 Installation Instructions
+
+            1. Download the APK file below (`NaveenBharat-${{ env.VERSION }}.apk`)
+            2. On your Android phone, open the downloaded file
+            3. If prompted, allow "Install from unknown sources" in Settings → Security
+            4. Tap **Install** and wait for it to complete
+            5. Open **Naveen Bharat** from your home screen
+
+            > ⚠️ This is a debug build intended for student distribution.
+            > It requires Android 7.0 (API 24) or higher.
+
+            ---
+            *Built automatically from the latest codebase via GitHub Actions.*
+          files: |
+            ${{ env.APK_FILE }}
+            ${{ env.APK_FIXED }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
